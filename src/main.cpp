@@ -8,33 +8,40 @@
 #include "enums.h"
 #include "control.h"
 
-// ── Pin definitions ───────────────────────────────────────────────────────────
-#define LOAD_CELL_DAT 4
-#define LOAD_CELL_CLK 2
 
-#define OPTICAL_SENSOR 10
+#define STEPPER_ENABLE 19
+
+#define LOAD_CELL_DAT 18
+#define LOAD_CELL_CLK 5
+
+#define OPTICAL_SENSOR 32
 
 #define MAIN_BELT_STEP        14   
-#define MAIN_BELT_DIR         18   
-#define LEAD_SCREW_STEP       32   
+#define MAIN_BELT_DIR         12 
+#define LEAD_SCREW_STEP       25  
 #define LEAD_SCREW_DIR        33  
-#define FORK_FORWARD_STEP     26   
-#define FORK_FORWARD_DIR      25  
+#define FORK_FORWARD_STEP     27   
+#define FORK_FORWARD_DIR      26  
 
-#define FORK_BELT_PWM         27   
-#define FORK_BELT_DIR         13   
+#define FORK_BELT_PWM         15   
+#define FORK_BELT_DIR         2   
 
 #define FORK_BELT_LEDC_CH   0
 #define FORK_BELT_LEDC_FREQ 5000
 #define FORK_BELT_LEDC_RES  8    // 8-bit → duty 0-255
 
-#define STEPPER_MAX_SPEED    300.0f   // steps/sec
-#define STEPPER_ACCELERATION 100.0f  // steps/sec²
+#define STEPPER_MAX_SPEED    100.0f   // steps/sec
+#define STEPPER_ACCELERATION 30.0f  // steps/sec²
 
 #define LOAD_CELL_THRESHOLD 100
 #define OPTICAL_SENSOR_THRESHOLD 600
 
 #define FORK_END_POSITION 1000
+
+#define FORK_FORWARD_LIMIT_SWITCHES 16 //TODO
+#define LEAD_SCREW_LIMIT_SWITCHES 17 //TODO
+
+#define FORK_FORWARD_MID_POSITION 200 //TODO
 
 #define DRIVER_MODE AccelStepper::DRIVER
 
@@ -63,6 +70,11 @@ WebSocketsServer ws(81);
 WebServer server(80);
 
 bool isAutomaticMode = false;
+
+volatile bool limitSwitchTriggered = false;
+volatile bool isForkLimitSwitch = false;
+
+LimitSwitchSource limitSwitchSource = NONE;
 
 // Routes
 void handleRoot() { server.send(200, "text/plain", "Server is running"); }
@@ -93,29 +105,31 @@ void handleForkBeltSetSpeed() {
 }
 
 
+void IRAM_ATTR onForkForwardLimitSwitch() {
+  limitSwitchTriggered = true;
+  isForkLimitSwitch = true;
+}
+void IRAM_ATTR onLeadScrewLimitSwitch() {
+  limitSwitchTriggered = true;
+}
+
 // Auto Mode
 
 bool weightDetected = false;
 bool objectPassed = false;
+long main_belt_pos_at_start;
+
 
 void automaticMode() {
-  //Load cell readings
-      //start belt
-      //read par
-      //adjust fork
-      //move fork out
-      //wait for optical sensor
-      //start fork belt and move fork back
     main_belt_mode = POSITION_MODE;
     lead_screw_mode = POSITION_MODE;
     fork_forward_mode = POSITION_MODE;
 
-    long main_belt_pos_at_start;
 
     float load_cell_value = 0;
+    scale.set_scale(calibration_factor);
+    load_cell_value = scale.get_units(10);
     if (load_cell_value < LOAD_CELL_THRESHOLD || !weightDetected) {
-      scale.set_scale(calibration_factor);
-      load_cell_value = scale.get_units(10);
       main_belt_pos_at_start = main_belt.currentPosition();
       delay(1000);
       return;
@@ -178,6 +192,33 @@ void electronicsLoop(void *parameter) {
   long prev_fork_forward = fork_forward.currentPosition();
 
   for (;;) {
+    if (!fork_forward.isRunning() && !lead_screw.isRunning() && !main_belt.isRunning()) {
+     digitalWrite(STEPPER_ENABLE, HIGH);
+    } else {
+      digitalWrite(STEPPER_ENABLE, LOW);
+    }
+    if (limitSwitchTriggered) {
+      if (isForkLimitSwitch) {
+        fork_forward.stop();
+        isAutomaticMode = false;
+
+        if (prev_fork_forward > FORK_FORWARD_MID_POSITION) {
+          limitSwitchSource = FORK_FORWARD_END;
+        }
+        else {
+          limitSwitchSource = FORK_FORWARD_START;
+        }
+      }
+      else {
+        lead_screw.stop();
+        isAutomaticMode = false;
+        limitSwitchSource = LEAD_SCREW;
+      }
+      ws.broadcastTXT(String("limit_switch/Limit switch was hit by ") + limitSwitchSourceStrings[limitSwitchSource] + ", enter manual mode and reset the position");
+      limitSwitchTriggered = false;
+    }
+
+
     if (main_belt_mode == SPEED_MODE)    main_belt.runSpeed();
     else                                 main_belt.run();
 
@@ -256,6 +297,9 @@ void setup() {
     pinMode(FORK_BELT_DIR, OUTPUT);
     digitalWrite(FORK_BELT_DIR, LOW);
 
+    pinMode(STEPPER_ENABLE, OUTPUT);
+    digitalWrite(STEPPER_ENABLE, LOW);
+
     // WiFi
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -296,7 +340,14 @@ void setup() {
 
     xTaskCreatePinnedToCore(webServerLoop,    "WebServer",   10000, NULL, 1, &WebServerHandler,    0);
     xTaskCreatePinnedToCore(electronicsLoop,  "Electronics", 10000, NULL, 2, &ElectronicsHandler,  1);
-}
+
+    pinMode(FORK_FORWARD_LIMIT_SWITCHES, INPUT_PULLUP);
+    pinMode(LEAD_SCREW_LIMIT_SWITCHES, INPUT_PULLUP);
+
+    attachInterrupt(digitalPinToInterrupt(FORK_FORWARD_LIMIT_SWITCHES), onForkForwardLimitSwitch, FALLING);
+    attachInterrupt(digitalPinToInterrupt(LEAD_SCREW_LIMIT_SWITCHES), onLeadScrewLimitSwitch, FALLING);
+
+  }
 
 // ── loop ──────────────────────────────────────────────────────────────────────
 
