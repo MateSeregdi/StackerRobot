@@ -16,7 +16,7 @@ void stepperSetSpeed(AccelStepper& stepper, MotorMode& mode, WebServer& server) 
 void stepperMoveTo(AccelStepper& stepper, MotorMode& mode, WebServer& server) {
     if (!server.hasArg("position")) {
         server.send(400, "text/plain", "Missing position");
-        return;
+        return; 
     }
     long target = server.arg("position").toInt();
     mode = POSITION_MODE;
