@@ -8,33 +8,28 @@
 #include "enums.h"
 #include "control.h"
 
-#include "lightranger14.h"
+#include "tmf8829_app.h"
 
 #define STEPPER_ENABLE 19
 
 #define LOAD_CELL_DAT 18
-#define LOAD_CELL_CLK 5
+#define LOAD_CELL_CLK 12
 
 #define OPTICAL_SENSOR 32
 
 #define MAIN_BELT_STEP        14
-#define MAIN_BELT_DIR         12
+#define MAIN_BELT_DIR         13
 #define LEAD_SCREW_STEP       25
 #define LEAD_SCREW_DIR        33
 #define FORK_FORWARD_STEP     27
 #define FORK_FORWARD_DIR      26
 
-#define FORK_BELT_PWM         15
-#define FORK_BELT_DIR         2
+#define FORK_BELT_IN1         23
+#define FORK_BELT_IN2         4
 
-// TODO: assign actual ESP32 GPIO pin numbers
-#define TOF_SCL   22
-#define TOF_SDA   21
-#define TOF_EN    4
-#define TOF_INT   35
-
-#define LIGHTRANGER14_MAP_WIDTH 16
-#define LIGHTRANGER14_MAP_HEIGHT 16
+#define UART_BAUD_RATE  115200
+#define I2C_CLK_SPEED   400000
+#define GRID_SIZE       16   
 
 #define FORK_BELT_LEDC_CH   0
 #define FORK_BELT_LEDC_FREQ 5000
@@ -55,13 +50,26 @@
 
 #define DRIVER_MODE AccelStepper::DRIVER
 
+
+// ── ToF geometry ──────────────────────────────────────────────────────────────
+#define TOF_SENSOR_HEIGHT_MM    800.0f  // sensor mount height above floor (mm) — adjust to your rig
+#define TOF_FOV_DEG             44.0f   // TMF8829 FoV per axis in degrees
+#define LEAD_SCREW_STEPS_PER_MM  10.0f  // lead screw steps per mm — tune to your hardware
+#define HOME_FORK_GAP_MM 0
+#define FORK_CLEARANCE_MM 5
+
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+
 // WS broadcast queue — all ws calls happen only in webServerLoop (core 0)
-#define WS_QUEUE_ITEM_SIZE 128
+#define WS_QUEUE_ITEM_SIZE 300  // must fit "tof/occupancy:" + 256 chars = 270 + margin
 #define WS_QUEUE_LENGTH    24
 
 // ── Forward declarations ──────────────────────────────────────────────────────
 void wsBroadcast(const String &msg);
-void broadcastValues(long &prev_main_belt, long &prev_lead_screw, long &prev_fork_forward);
+void broadcastMotorValues(long &prev_main_belt, long &prev_lead_screw, long &prev_fork_forward);
 void runMotors();
 void setEnable();
 void limitSwitchCheck(long prev_fork_forward);
@@ -76,6 +84,7 @@ void limitSwitchSetup();
 TaskHandle_t WebServerHandler;
 TaskHandle_t ElectronicsHandler;
 TaskHandle_t ToFHandler;
+TaskHandle_t LoadCellHandler;
 
 HX711 scale;
 
@@ -88,8 +97,6 @@ MotorMode lead_screw_mode   = POSITION_MODE;
 MotorMode fork_forward_mode = POSITION_MODE;
 
 float calibration_factor = -7050;
-bool  calibration_mode   = false;
-float calibration_step   = 10.0;
 
 const char* WIFI_SSID     = "hh";
 const char* WIFI_PASSWORD = "asd12345";
@@ -103,23 +110,21 @@ bool isAutomaticMode = false;
 
 volatile bool limitSwitchTriggered = false;
 volatile bool isForkLimitSwitch    = false;
-volatile bool tofReadingReady      = false;
 
 LimitSwitchSource limitSwitchSource = NONE;
 
-lightranger14_t tof;
+bool osEnabled = false;
 
-struct ToFResult {
-  float   distance[LIGHTRANGER14_MAP_WIDTH][LIGHTRANGER14_MAP_HEIGHT];
-  uint8_t confidence[LIGHTRANGER14_MAP_WIDTH][LIGHTRANGER14_MAP_HEIGHT];
-  bool    valid[LIGHTRANGER14_MAP_WIDTH][LIGHTRANGER14_MAP_HEIGHT];
-};
+bool isHomingMode = false;
+bool isLeadScrewHomed = false;
 
-ToFResult tofResult;
-uint8_t   frameData[LIGHTRANGER14_FRAME_PAYLOAD_SIZE];
-uint16_t  floorMap[LIGHTRANGER14_MAP_WIDTH][LIGHTRANGER14_MAP_HEIGHT];
-bool      occupancy[LIGHTRANGER14_MAP_WIDTH][LIGHTRANGER14_MAP_HEIGHT];
-bool      prevOccupancy[LIGHTRANGER14_MAP_WIDTH][LIGHTRANGER14_MAP_HEIGHT];
+volatile bool tarePending = false;
+
+
+
+uint16_t  floorMap[GRID_SIZE][GRID_SIZE];
+bool      occupancy[GRID_SIZE][GRID_SIZE];
+bool      prevOccupancy[GRID_SIZE][GRID_SIZE];
 bool      isFloorCalibrated    = false;
 bool      tofEnabled           = false;
 volatile bool isCalibrationRequested = false;
@@ -143,36 +148,49 @@ void handleMainBeltPositionAndSpeed() { stepperGetPositionAndSpeed(main_belt, se
 void handleLeadScrewSetSpeed()         { stepperSetSpeed(lead_screw, lead_screw_mode, server); }
 void handleLeadScrewMoveTo()           { stepperMoveTo(lead_screw, lead_screw_mode, server); }
 void handleLeadScrewPositionAndSpeed() { stepperGetPositionAndSpeed(lead_screw, server); }
+void handleLeadScrewHome() {homeLeadScrew(isHomingMode, lead_screw);}
 
 // fork_forward
 void handleForkForwardSetSpeed()         { stepperSetSpeed(fork_forward, fork_forward_mode, server); }
 void handleForkForwardMoveTo()           { stepperMoveTo(fork_forward, fork_forward_mode, server); }
 void handleForkForwardPositionAndSpeed() { stepperGetPositionAndSpeed(fork_forward, server); }
 
-void handleLoadCellCalibration() {
-  loadCellCalibrate(server, scale, calibration_mode, calibration_factor, calibration_step);
+void handleTare() {
+  tarePending = true;
+  server.send(200, "text/plain", "Tare requested");
 }
-void handleLoadCellRead() {
-  loadCellRead(scale, server, calibration_mode, calibration_factor);
+void handleGetCalibrationFactor() {
+  server.send(200, "text/plain", String(calibration_factor));
+}
+void handleSetCalibrationFactor() {
+  if (!server.hasArg("value")) {
+    server.send(400, "text/plain", "Missing value");
+    return;
+  }
+  calibration_factor = server.arg("value").toFloat();
+  scale.set_scale(calibration_factor);
+  server.send(200, "text/plain", String(calibration_factor));
+  wsBroadcast("load_cell/calibration_factor/" + String(calibration_factor));
 }
 void handleForkBeltSetSpeed() {
-  forkBeltSetSpeed(server, FORK_BELT_DIR, FORK_BELT_LEDC_CH);
+  forkBeltSetSpeed(server, FORK_BELT_IN1, FORK_BELT_IN2, FORK_BELT_LEDC_CH);
 }
+void handleOpticalSensorEnable()  { osEnabled = true;  server.send(200, "text/plain", "Optical sensor enabled"); }
+void handleOpticalSensorDisable() { osEnabled = false; server.send(200, "text/plain", "Optical sensor disabled"); }
+
+void handleAutoEnable()  { isAutomaticMode = true;  server.send(200, "text/plain", "Automatic mode enabled"); }
+void handleAutoDisable() { isAutomaticMode = false; server.send(200, "text/plain", "Automatic mode disabled"); }
 
 // ToF routes
 void handleToFEnable() {
-  lightranger14_enable_device(&tof);
-  if (lightranger14_default_cfg(&tof) != 0) {
-    server.send(400, "text/plain", "ToF sensor init failed");
-    return;
-  }
+  autoStartFn();
+  setResolutionFn(TMF8829_CMD_STAT__cmd_stat__CMD_LOAD_CFG_16X16);
   tofEnabled = true;
   server.send(200, "text/plain", "ToF sensor enabled");
 }
 
 void handleToFDisable() {
-  lightranger14_stop_measurement(&tof);
-  lightranger14_disable_device(&tof);
+  disableFn();
   tofEnabled = false;
   server.send(200, "text/plain", "ToF sensor disabled");
 }
@@ -190,14 +208,14 @@ void handleToFData() {
   String json = "{\"calibrated\":";
   json += isFloorCalibrated ? "true" : "false";
   json += ",\"occupancy\":[";
-  for (int y = 0; y < LIGHTRANGER14_MAP_HEIGHT; y++) {
+  for (int y = 0; y < GRID_SIZE; y++) {
     json += "[";
-    for (int x = 0; x < LIGHTRANGER14_MAP_WIDTH; x++) {
+    for (int x = 0; x < GRID_SIZE; x++) {
       json += occupancy[y][x] ? "1" : "0";
-      if (x < LIGHTRANGER14_MAP_WIDTH - 1) json += ",";
+      if (x < GRID_SIZE - 1) json += ",";
     }
     json += "]";
-    if (y < LIGHTRANGER14_MAP_HEIGHT - 1) json += ",";
+    if (y < GRID_SIZE - 1) json += ",";
   }
   json += "]}";
   server.send(200, "application/json", json);
@@ -211,48 +229,24 @@ void IRAM_ATTR onForkForwardLimitSwitch() {
 void IRAM_ATTR onLeadScrewLimitSwitch() {
   limitSwitchTriggered = true;
 }
-void IRAM_ATTR tofInterrupt() {
-  tofReadingReady = true;
-}
-
-// ── ToF frame processing ──────────────────────────────────────────────────────
-void readFrame() {
-  if (lightranger14_clear_interrupts(&tof) != 0) {
-    Serial.println("Interrupt clear failed");
-    return;
-  }
-  if (lightranger14_read_results(&tof, frameData, (uint16_t)sizeof(frameData)) != 0) {
-    Serial.println("Frame reading failed");
-    return;
-  }
-  int pixelIndex = 0;
-  for (int y = 0; y < LIGHTRANGER14_MAP_HEIGHT; y++) {
-    for (int x = 0; x < LIGHTRANGER14_MAP_WIDTH; x++) {
-      uint16_t rawDistance   = ((uint16_t)frameData[pixelIndex + 1] << 8) | frameData[pixelIndex];
-      uint8_t  rawConfidence = frameData[pixelIndex + 2];
-      tofResult.distance[y][x]   = rawDistance / 4.0f;
-      tofResult.confidence[y][x] = rawConfidence;
-      tofResult.valid[y][x]      = (rawConfidence > LIGHTRANGER14_CONFIDENCE_THRESHOLD);
-      pixelIndex += 3;
-    }
-  }
-}
 
 void processFrame() {
-  for (int y = 0; y < LIGHTRANGER14_MAP_HEIGHT; y++) {
-    for (int x = 0; x < LIGHTRANGER14_MAP_WIDTH; x++) {
-      if (!tofResult.valid[y][x]) continue;
-      float height  = floorMap[y][x] - tofResult.distance[y][x];
+  for (int y = 0; y < GRID_SIZE; y++) {
+    for (int x = 0; x < GRID_SIZE; x++) {
+      uint16_t zone = y * GRID_SIZE + x;
+      if (tofResults.confidence[zone] == 0) continue;
+      int32_t height = (int32_t)floorMap[y][x] - (int32_t)tofResults.distance_mm[zone];
       occupancy[y][x] = (height > 30);
     }
   }
 }
 
 void processCalibrateFrame() {
-  for (int y = 0; y < LIGHTRANGER14_MAP_HEIGHT; y++) {
-    for (int x = 0; x < LIGHTRANGER14_MAP_WIDTH; x++) {
-      if (!tofResult.valid[y][x]) continue;
-      floorMap[y][x] = (uint16_t)tofResult.distance[y][x];
+  for (int y = 0; y < GRID_SIZE; y++) {
+    for (int x = 0; x < GRID_SIZE; x++) {
+      uint16_t zone = y * GRID_SIZE + x;
+      if (tofResults.confidence[zone] == 0) continue;
+      floorMap[y][x] = tofResults.distance_mm[zone];
     }
   }
   isFloorCalibrated = true;
@@ -260,10 +254,8 @@ void processCalibrateFrame() {
 
 void tofTask(void *parameter) {
   while (true) {
-    if (tofEnabled && tofReadingReady) {
-      tofReadingReady = false;
-      readFrame();
-
+    if (tofResults.ready) {
+      tofResults.ready = false;   
       if (isCalibrationRequested) {
         processCalibrateFrame();
         isCalibrationRequested = false;
@@ -271,22 +263,111 @@ void tofTask(void *parameter) {
         processFrame();
 
         bool changed = false;
-        for (int y = 0; y < LIGHTRANGER14_MAP_HEIGHT && !changed; y++)
-          for (int x = 0; x < LIGHTRANGER14_MAP_WIDTH && !changed; x++)
+        for (int y = 0; y < GRID_SIZE && !changed; y++)
+          for (int x = 0; x < GRID_SIZE && !changed; x++)
             if (occupancy[y][x] != prevOccupancy[y][x]) changed = true;
 
         if (changed) {
           String msg = "tof/occupancy:";
-          for (int y = 0; y < LIGHTRANGER14_MAP_HEIGHT; y++)
-            for (int x = 0; x < LIGHTRANGER14_MAP_WIDTH; x++)
+          for (int y = 0; y < GRID_SIZE; y++)
+            for (int x = 0; x < GRID_SIZE; x++)
               msg += occupancy[y][x] ? "1" : "0";
           wsBroadcast(msg);
           memcpy(prevOccupancy, occupancy, sizeof(occupancy));
         }
       }
+
     }
     vTaskDelay(pdMS_TO_TICKS(5));
   }
+}
+
+void loadCellTask(void *parameter) {
+  const float THRESHOLD = 0.5f;
+  float prev = 0.0f;
+  for (;;) {
+    if (tarePending) {
+      scale.tare(10);
+      tarePending = false;
+      prev = 0.0f;
+      wsBroadcast("load_cell/reading/0.00");
+    } else {
+      scale.set_scale(calibration_factor);
+      float value = scale.get_units(3);
+      if (fabsf(value - prev) >= THRESHOLD) {
+        wsBroadcast("load_cell/reading/" + String(value, 2));
+        prev = value;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(150));
+  }
+}
+
+// ── ToF width measurement ─────────────────────────────────────────────────────
+// Scans occupancy[][], finds the leftmost and rightmost occupied column, then
+// computes the physical width of that span at the measured box-top distance.
+// Returns 0 if no occupied zones are found.
+// Zones seeing the box top are at the minimum distance. Zones seeing the box
+// side wall are farther away. We use this tolerance (mm) to separate them.
+#define TOF_WALL_TOLERANCE_MM 40
+
+float calculateBoxWidthMm()
+{
+  // Pass 1: find the minimum distance among all occupied zones (= box top surface)
+  uint16_t min_dist = 0xFFFF;
+  for (int y = 0; y < GRID_SIZE; y++) {
+    for (int x = 0; x < GRID_SIZE; x++) {
+      if (!occupancy[y][x]) continue;
+      uint16_t zone = (uint16_t)(y * GRID_SIZE + x);
+      if (tofResults.distance_mm[zone] < min_dist)
+        min_dist = tofResults.distance_mm[zone];
+    }
+  }
+  if (min_dist == 0xFFFF) return 0.0f;
+
+  // Pass 2: use only top-surface zones (distance ≤ min + tolerance)
+  // Side-wall zones are always farther than the flat top, so they get excluded.
+  uint16_t dist_threshold = min_dist + TOF_WALL_TOLERANCE_MM;
+  int   col_min  = GRID_SIZE;
+  int   col_max  = -1;
+  float sum_dist = 0.0f;
+  int   count    = 0;
+
+  for (int y = 0; y < GRID_SIZE; y++) {
+    for (int x = 0; x < GRID_SIZE; x++) {
+      if (!occupancy[y][x]) continue;
+      uint16_t zone = (uint16_t)(y * GRID_SIZE + x);
+      if (tofResults.distance_mm[zone] > dist_threshold) continue; // side wall — skip
+      if (x < col_min) col_min = x;
+      if (x > col_max) col_max = x;
+      sum_dist += tofResults.distance_mm[zone];
+      count++;
+    }
+  }
+
+  if (count == 0) return 0.0f;
+
+  float box_dist_mm  = sum_dist / (float)count;
+  float deg_per_zone = TOF_FOV_DEG / (float)GRID_SIZE;
+  float half_grid    = GRID_SIZE / 2.0f;
+
+  float left_rad  = (col_min        - half_grid) * deg_per_zone * (M_PI / 180.0f);
+  float right_rad = (col_max + 1.0f - half_grid) * deg_per_zone * (M_PI / 180.0f);
+
+  return box_dist_mm * (tanf(right_rad) - tanf(left_rad));
+}
+
+void measureOpticalSensor() {
+  static uint32_t lastSent = 0;
+  if (millis() - lastSent < 100) return;
+  lastSent = millis();
+
+  int raw = analogRead(OPTICAL_SENSOR);
+  float volts = raw * (3.3f / 4095.0f);
+  if (volts <= 0.0f) return;
+  float distance = (13.5f / volts) - 0.42f;
+  if (distance < 4.0f || distance > 28.0f) distance = -1.0f;
+  wsBroadcast("optical_sensor/" + String(distance));
 }
 
 // ── Auto Mode ─────────────────────────────────────────────────────────────────
@@ -310,15 +391,20 @@ void automaticMode() {
 
   if (main_belt.currentPosition() < main_belt_pos_at_start + 1000) return;
 
-  // TODO: calculate lead_screw target from ToF width measurement
-  long lead_screw_target_pos = 1000;
+  float box_width_mm          = calculateBoxWidthMm();
+
+  float gap_needed_mm = box_width_mm - HOME_FORK_GAP_MM + FORK_CLEARANCE_MM;
+  long lead_screw_target_pos = (long)(gap_needed_mm * LEAD_SCREW_STEPS_PER_MM);
+
   lead_screw.moveTo(lead_screw_target_pos);
   fork_forward.moveTo(FORK_END_POSITION);
 
   if (lead_screw.currentPosition() != lead_screw_target_pos ||
       fork_forward.currentPosition() != FORK_END_POSITION) return;
 
-  int distance = analogRead(OPTICAL_SENSOR);
+  int raw = analogRead(OPTICAL_SENSOR);
+  float volts = raw * (5.0 / 1023.0); 
+  float distance = (13.5 / volts) - 0.42;
 
   if (distance < OPTICAL_SENSOR_THRESHOLD && !objectPassed) return;
   objectPassed = true;
@@ -326,6 +412,8 @@ void automaticMode() {
 
   fork_forward.moveTo(0);
   if (fork_forward.currentPosition() != 0) {
+    digitalWrite(FORK_BELT_IN2, LOW);
+    ledcAttachPin(FORK_BELT_IN1, FORK_BELT_LEDC_CH);
     ledcWrite(FORK_BELT_LEDC_CH, 255);
     return;
   }
@@ -355,7 +443,10 @@ void electronicsLoop(void *parameter) {
     setEnable();
     limitSwitchCheck(prev_fork_forward);
     runMotors();
-    broadcastValues(prev_main_belt, prev_lead_screw, prev_fork_forward);
+    broadcastMotorValues(prev_main_belt, prev_lead_screw, prev_fork_forward);
+    loopFn();
+
+    if (osEnabled) measureOpticalSensor();
 
     if (isAutomaticMode) automaticMode();
 
@@ -363,7 +454,7 @@ void electronicsLoop(void *parameter) {
   }
 }
 
-void broadcastValues(long &prev_main_belt, long &prev_lead_screw, long &prev_fork_forward) {
+void broadcastMotorValues(long &prev_main_belt, long &prev_lead_screw, long &prev_fork_forward) {
   long  pos;
   float spd;
 
@@ -396,7 +487,7 @@ void runMotors() {
 }
 
 void setEnable() {
-  if (!fork_forward.isRunning() && !lead_screw.isRunning() && !main_belt.isRunning())
+  if (fork_forward.speed() == 0.0f && lead_screw.speed() == 0.0f && main_belt.speed() == 0.0f)
     digitalWrite(STEPPER_ENABLE, HIGH);
   else
     digitalWrite(STEPPER_ENABLE, LOW);
@@ -410,14 +501,24 @@ void limitSwitchCheck(long prev_fork_forward) {
     isAutomaticMode   = false;
     limitSwitchSource = (prev_fork_forward > FORK_FORWARD_MID_POSITION)
                           ? FORK_FORWARD_END : FORK_FORWARD_START;
+  } else if (isHomingMode) {
+    lead_screw.stop();
+    lead_screw.setCurrentPosition(0);
   } else {
     lead_screw.stop();
     isAutomaticMode   = false;
     limitSwitchSource = LEAD_SCREW;
   }
-  wsBroadcast(String("limit_switch/Limit switch was hit by ") +
+  if (!isHomingMode) {
+      wsBroadcast(String("limit_switch/Limit switch was hit by ") +
               limitSwitchSourceStrings[limitSwitchSource] +
               ", enter manual mode and reset the position");
+  }
+  else {
+    wsBroadcast(String("lead_screw_homed"));
+    isHomingMode = false;
+  }
+
   limitSwitchTriggered = false;
 }
 
@@ -435,21 +536,13 @@ void setup() {
   serverSetup();
   limitSwitchSetup();
 
-  lightranger14_cfg_t tof_cfg;
-  lightranger14_cfg_setup(&tof_cfg);
-  tof_cfg.scl     = TOF_SCL;
-  tof_cfg.sda     = TOF_SDA;
-  tof_cfg.en      = TOF_EN;
-  tof_cfg.int_pin = TOF_INT;
-  lightranger14_init(&tof, &tof_cfg);
+  setupFn( 0, UART_BAUD_RATE, I2C_CLK_SPEED );  // sensor stays disabled until /tof/enable
 
-  // Sensor starts disabled; use /tof/enable to start it
-  lightranger14_disable_device(&tof);
-  attachInterrupt(digitalPinToInterrupt(TOF_INT), tofInterrupt, FALLING);
 
   xTaskCreatePinnedToCore(webServerLoop,   "WebServer",   10000, NULL, 1, &WebServerHandler,   0);
   xTaskCreatePinnedToCore(electronicsLoop, "Electronics", 10000, NULL, 2, &ElectronicsHandler,  1);
   xTaskCreatePinnedToCore(tofTask,         "ToF",         10000, NULL, 3, &ToFHandler,          1);
+  xTaskCreatePinnedToCore(loadCellTask,    "LoadCell",     4096, NULL, 1, &LoadCellHandler,     1);
 }
 
 void limitSwitchSetup() {
@@ -461,8 +554,9 @@ void limitSwitchSetup() {
 
 void serverSetup() {
   server.on("/",                              handleRoot);
-  server.on("/load_cell/calibrate",           handleLoadCellCalibration);
-  server.on("/load_cell/read",                handleLoadCellRead);
+  server.on("/load_cell/tare",                   handleTare);
+  server.on("/load_cell/calibration_factor",     handleGetCalibrationFactor);
+  server.on("/load_cell/set_calibration_factor", handleSetCalibrationFactor);
 
   server.on("/motor/main_belt/set_speed",     handleMainBeltSetSpeed);
   server.on("/motor/main_belt/move_to",       handleMainBeltMoveTo);
@@ -471,6 +565,7 @@ void serverSetup() {
   server.on("/motor/lead_screw/set_speed",    handleLeadScrewSetSpeed);
   server.on("/motor/lead_screw/move_to",      handleLeadScrewMoveTo);
   server.on("/motor/lead_screw/position",     handleLeadScrewPositionAndSpeed);
+  server.on("home_lead_screw", handleLeadScrewHome);
 
   server.on("/motor/fork_forward/set_speed",  handleForkForwardSetSpeed);
   server.on("/motor/fork_forward/move_to",    handleForkForwardMoveTo);
@@ -482,6 +577,15 @@ void serverSetup() {
   server.on("/tof/disable",                   handleToFDisable);
   server.on("/tof/calibrate",                 handleToFCalibration);
   server.on("/tof/data",                      handleToFData);
+
+  server.on("/optical_sensor/enable",  handleOpticalSensorEnable);
+  server.on("/optical_sensor/disable", handleOpticalSensorDisable);
+
+  server.on("/auto/enable",  handleAutoEnable);
+  server.on("/auto/disable", handleAutoDisable);
+
+
+
 
   server.begin();
   ws.begin();
@@ -506,9 +610,10 @@ void wifiSetup() {
 
 void dcMotorSetup() {
   ledcSetup(FORK_BELT_LEDC_CH, FORK_BELT_LEDC_FREQ, FORK_BELT_LEDC_RES);
-  ledcAttachPin(FORK_BELT_PWM, FORK_BELT_LEDC_CH);
-  pinMode(FORK_BELT_DIR, OUTPUT);
-  digitalWrite(FORK_BELT_DIR, LOW);
+  pinMode(FORK_BELT_IN1, OUTPUT);
+  pinMode(FORK_BELT_IN2, OUTPUT);
+  digitalWrite(FORK_BELT_IN1, LOW);
+  digitalWrite(FORK_BELT_IN2, LOW);
 }
 
 void stepperSetup() {
@@ -519,7 +624,7 @@ void stepperSetup() {
   fork_forward.setMaxSpeed(STEPPER_MAX_SPEED);
   fork_forward.setAcceleration(STEPPER_ACCELERATION);
   pinMode(STEPPER_ENABLE, OUTPUT);
-  digitalWrite(STEPPER_ENABLE, LOW);
+  digitalWrite(STEPPER_ENABLE, HIGH);
 }
 
 void loadCellSetup() {

@@ -36,8 +36,16 @@ class AppState:
             "lead_screw":   tk.StringVar(value="—"),
             "fork_forward": tk.StringVar(value="—"),
         }
+        self.lead_screw_homed = tk.StringVar(value="false")
+
         self.fork_belt_speed = tk.StringVar(value="—")
         self.fork_belt_dir = tk.StringVar(value="—")
+
+        self.tof_occupancy = tk.StringVar(
+            value="")   # 256-char string of "0"/"1"
+        self.tof_calibrated = tk.StringVar(value="false")
+
+        self.box_width = tk.StringVar(value="—")
 
     def update(self, **kwargs) -> None:
         """Post one or more state changes from any thread."""

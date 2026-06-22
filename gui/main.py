@@ -38,26 +38,23 @@ def _thread(fn, *args):
 lc_frame = tk.LabelFrame(manual_frame, text="Load Cell", padx=6, pady=6)
 lc_frame.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
 
-tk.Label(lc_frame, text="Reading:", font=(
-    "Arial", 9, "bold"), fg="#555").pack()
+tk.Label(lc_frame, text="Reading:", font=("Arial", 9, "bold"), fg="#555").pack()
 tk.Label(lc_frame, textvariable=state.lc_reading,
          font=("Arial", 11, "bold")).pack(pady=(0, 6))
 
-for _label, _action in [
-    ("Start Calibration", "start"),
-    ("Factor +",          "increase"),
-    ("Factor −",          "decrease"),
-    ("Stop Calibration",  "stop"),
-]:
-    tk.Button(
-        lc_frame, text=_label, width=18,
-        command=lambda a=_action: _thread(api.calibrate_load_cell, a, state),
-    ).pack(pady=1)
+tk.Label(lc_frame, text="Cal. Factor:", font=("Arial", 9, "bold"), fg="#555").pack()
+tk.Label(lc_frame, textvariable=state.cal_factor,
+         font=("Courier", 10)).pack(pady=(0, 4))
 
-tk.Button(
-    lc_frame, text="Read", width=18,
-    command=lambda: _thread(api.read_load_cell, state),
-).pack(pady=(6, 2))
+_cf_entry = tk.Entry(lc_frame, width=16)
+_cf_entry.pack(pady=(0, 2))
+tk.Button(lc_frame, text="Set Cal. Factor", width=18,
+          command=lambda: _thread(api.set_calibration_factor, _cf_entry.get(), state)
+          ).pack(pady=(2, 8))
+
+tk.Button(lc_frame, text="Tare", width=18,
+          command=lambda: _thread(api.tare_load_cell, state)
+          ).pack(pady=2)
 
 
 # ── Stepper motor panels ──────────────────────────────────────────────────────
@@ -66,6 +63,10 @@ def stepper_section(parent, name, display, row, col):
     frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
 
     mode = tk.StringVar(value="speed")
+
+    if (name == "lead_screw"):
+        tk.Button(frame, text="Home Lead Screw",
+                  command=lambda: _thread(api.home_lead_screw, state)).pack(pady=(2, 2))
 
     rb_row = tk.Frame(frame)
     rb_row.pack(fill=tk.X)
@@ -77,17 +78,26 @@ def stepper_section(parent, name, display, row, col):
     # Speed panel
     spd_panel = tk.Frame(frame)
     spd_var = tk.IntVar(value=0)
-    spd_lbl = tk.Label(spd_panel, text="0  steps / sec", width=18)
-    spd_lbl.pack(pady=(4, 0))
+    tk.Label(spd_panel, textvariable=state.motor_speed[name],
+             font=("Arial", 11, "bold"), width=18).pack(pady=(4, 0))
     tk.Scale(
         spd_panel, from_=-300, to=300, orient=tk.HORIZONTAL,
         variable=spd_var, length=250,
-        command=lambda v: spd_lbl.config(text=f"{v}  steps / sec"),
     ).pack()
     tk.Button(
         spd_panel, text="Apply Speed",
         command=lambda: _thread(api.set_motor_speed,
                                 name, spd_var.get(), state),
+    ).pack(pady=(5, 2))
+
+    def stop():
+        _thread(api.set_motor_speed, name, 0, state)
+        spd_var.set(0)
+        state.motor_speed[name].set("0")
+
+    tk.Button(
+        spd_panel, text="Stop",
+        command=stop
     ).pack(pady=(5, 2))
 
     # Position panel
@@ -136,22 +146,20 @@ def dc_section(parent, row, col):
     spd_var = tk.IntVar(value=0)
     dir_var = tk.StringVar(value="forward")
 
-    spd_lbl = tk.Label(frame, text="Speed: 0 / 255",
-                       font=("Arial", 10, "bold"))
-    spd_lbl.pack(pady=(4, 0))
+    tk.Label(frame, textvariable=state.fork_belt_speed,
+             font=("Arial", 10, "bold")).pack(pady=(4, 0))
     tk.Scale(
         frame, from_=0, to=255, orient=tk.HORIZONTAL,
         variable=spd_var, length=250,
-        command=lambda v: spd_lbl.config(text=f"Speed: {v} / 255"),
     ).pack()
 
     dir_row = tk.Frame(frame)
     dir_row.pack(pady=6)
     tk.Label(dir_row, text="Direction:").pack(side=tk.LEFT, padx=(0, 8))
     tk.Radiobutton(dir_row, text="Forward",  variable=dir_var,
-                   value="forward").pack(side=tk.LEFT)
-    tk.Radiobutton(dir_row, text="Backward", variable=dir_var,
                    value="backward").pack(side=tk.LEFT)
+    tk.Radiobutton(dir_row, text="Backward", variable=dir_var,
+                   value="forward").pack(side=tk.LEFT)
 
     tk.Button(
         frame, text="Apply", width=14,
@@ -167,8 +175,80 @@ dc_section(manual_frame, row=2, col=0)
 
 for _r in range(3):
     manual_frame.rowconfigure(_r, weight=1)
-for _c in range(2):
+for _c in range(3):
     manual_frame.columnconfigure(_c, weight=1)
+
+# Optical Sensor
+os_frame = tk.LabelFrame(manual_frame, text="Optical Sensor", padx=6, pady=6)
+os_frame.grid(row=2, column=1, padx=5, pady=5, sticky="nsew")
+tk.Label(os_frame, text="Distance (cm)", font=("Arial", 9, "bold"),
+         fg="#555").pack(pady=4)
+tk.Label(os_frame, textvariable=state.optical_sensor, font=("Courier", 13),
+         anchor="e").pack()
+tk.Button(os_frame, text="Start Readings", width=14,
+          command=lambda: _thread(api.enable_optical_sensor_measuring, state)
+          ).pack(pady=4)
+tk.Button(os_frame, text="Stop Readings", width=14, command=lambda: _thread(
+    api.disable_optical_sensor_measuring, state)
+).pack(pady=4)
+
+
+# ═══════════════════════════ TOF SHARED HELPERS ═══════════════════════════════
+
+_TOF_GRID = 16
+_TOF_CELL = 20
+_COLOR_OCCUPIED = "#e74c3c"
+_COLOR_FREE = "#2ecc71"
+_COLOR_UNKNOWN = "#555555"
+
+
+def _make_tof_canvas(parent):
+    """Build a 16x16 canvas wired to state.tof_occupancy. Returns the canvas."""
+    size = _TOF_GRID * _TOF_CELL
+    canvas = tk.Canvas(parent, width=size, height=size,
+                       bg="#222", highlightthickness=0)
+    canvas.pack(padx=4, pady=4)
+
+    rects = [
+        canvas.create_rectangle(
+            x * _TOF_CELL, y * _TOF_CELL,
+            (x + 1) * _TOF_CELL, (y + 1) * _TOF_CELL,
+            fill=_COLOR_UNKNOWN, outline="#111", width=1,
+        )
+        for y in range(_TOF_GRID) for x in range(_TOF_GRID)
+    ]
+
+    def _redraw(*_):
+        data = state.tof_occupancy.get()
+        for i, rect in enumerate(rects):
+            if i >= len(data):
+                canvas.itemconfig(rect, fill=_COLOR_UNKNOWN)
+            elif data[i] == "1":
+                canvas.itemconfig(rect, fill=_COLOR_OCCUPIED)
+            else:
+                canvas.itemconfig(rect, fill=_COLOR_FREE)
+
+    state.tof_occupancy.trace_add("write", _redraw)
+    return canvas
+
+
+# ── Manual tab: ToF full controls ────────────────────────────────────────────
+_tof_manual = tk.LabelFrame(manual_frame, text="ToF Sensor", padx=6, pady=6)
+_tof_manual.grid(row=0, column=2, rowspan=3, padx=5, pady=5, sticky="n")
+
+_ena_row = tk.Frame(_tof_manual)
+_ena_row.pack(pady=(0, 2))
+tk.Button(_ena_row, text="Enable",  width=9,
+          command=lambda: _thread(api.enable_tof,  state)).pack(side=tk.LEFT, padx=2)
+tk.Button(_ena_row, text="Disable", width=9,
+          command=lambda: _thread(api.disable_tof, state)).pack(side=tk.LEFT, padx=2)
+
+tk.Button(_tof_manual, text="Calibrate Floor", width=20,
+          command=lambda: _thread(api.calibrate_tof, state)).pack(pady=2)
+tk.Button(_tof_manual, text="Read Data",       width=20,
+          command=lambda: _thread(api.read_tof_data, state)).pack(pady=(2, 6))
+
+_make_tof_canvas(_tof_manual)
 
 
 # ═══════════════════════════ AUTOMATIC TAB ════════════════════════════════════
@@ -188,28 +268,96 @@ def _stat_row(card, label_text, var, row, big=False):
              anchor="e").grid(row=row, column=1, sticky="e", padx=(16, 0), pady=pad)
 
 
+# ── Auto mode control ─────────────────────────────────────────────────────────
+def handleAutoEnable():
+    if state.lead_screw_homed.get() == "true":
+        _thread(api.enable_auto_mode, state)
+    else:
+        state.update(
+            status="Lead screw is not homed, can't start automatic mode")
+
+
+_auto_ctrl = tk.Frame(auto_frame)
+_auto_ctrl.grid(row=0, column=0, columnspan=3,
+                padx=5, pady=(4, 2), sticky="ew")
+_enable_color = "#2ecc71" if state.lead_screw_homed == "true" else "#646565"
+
+tk.Button(
+    _auto_ctrl, text="Enable Auto Mode", width=20,
+    bg=_enable_color, activebackground="#27ae60",
+    command=handleAutoEnable
+
+).pack(side=tk.LEFT, padx=8)
+tk.Button(
+    _auto_ctrl, text="Disable Auto Mode", width=20,
+    bg="#e44937", activebackground="#c0392b", fg="white",
+    command=lambda: _thread(api.disable_auto_mode, state),
+).pack(side=tk.LEFT, padx=4)
+
+
 for _name, _display, _r, _c in [
-    ("main_belt",    "Main Belt",    0, 0),
-    ("lead_screw",   "Lead Screw",   0, 1),
-    ("fork_forward", "Fork Forward", 1, 0),
+    ("main_belt",    "Main Belt",    1, 0),
+    ("lead_screw",   "Lead Screw",   1, 1),
+    ("fork_forward", "Fork Forward", 2, 0),
 ]:
     _card = _auto_card(auto_frame, _display, _r, _c)
-    _stat_row(_card, "Position (steps)",
-              state.motor_position[_name], row=0, big=True)
-    _stat_row(_card, "Speed",            state.motor_speed[_name],    row=1)
 
-_fb = _auto_card(auto_frame, "Fork Belt (DC)", row=1, col=1)
+    if (_name == "lead_screw"):
+        _homed_indicator = tk.Label(_card, text="● Not Homed",
+                                    fg="#e74c3c", font=("Arial", 10, "bold"))
+        _homed_indicator.grid(row=0)
+
+        def _refresh_homed_indicator(*_):
+            if state.lead_screw_homed.get() == "true":
+                _homed_indicator.config(text="● Homed",     fg="#2ecc71")
+            else:
+                _homed_indicator.config(text="● Not Homed", fg="#e74c3c")
+        state.lead_screw_homed.trace_add("write", _refresh_homed_indicator)
+
+    _stat_row(_card, "Position (steps)",
+              state.motor_position[_name], row=1, big=True)
+    _stat_row(_card, "Speed",            state.motor_speed[_name],    row=2)
+
+
+_fb = _auto_card(auto_frame, "Fork Belt (DC)", row=2, col=1)
 _stat_row(_fb, "Speed",     state.fork_belt_speed, row=0, big=True)
 _stat_row(_fb, "Direction", state.fork_belt_dir,   row=1)
 
-_lc = _auto_card(auto_frame, "Load Cell", row=2, col=0)
+_lc = _auto_card(auto_frame, "Load Cell", row=3, col=0)
 _stat_row(_lc, "Reading",     state.lc_reading, row=0, big=True)
 _stat_row(_lc, "Cal. Factor", state.cal_factor, row=1)
 
-for _r in range(3):
+for _r in range(4):
     auto_frame.rowconfigure(_r, weight=1)
-for _c in range(2):
+for _c in range(3):
     auto_frame.columnconfigure(_c, weight=1)
+
+# ── Automatic tab: ToF display-only ──────────────────────────────────────────
+_tof_auto = tk.LabelFrame(auto_frame, text="ToF Occupancy", padx=6, pady=6)
+_tof_auto.grid(row=1, column=2, rowspan=3, padx=5, pady=5, sticky="n")
+
+_cal_indicator = tk.Label(_tof_auto, text="● Not calibrated",
+                          fg="#e74c3c", font=("Arial", 10, "bold"))
+_cal_indicator.pack(pady=(0, 4))
+
+
+def _refresh_cal_indicator(*_):
+    if state.tof_calibrated.get() == "true":
+        _cal_indicator.config(text="● Calibrated",     fg="#2ecc71")
+    else:
+        _cal_indicator.config(text="● Not calibrated", fg="#e74c3c")
+
+
+state.tof_calibrated.trace_add("write", _refresh_cal_indicator)
+bw_row = tk.Frame(_tof_auto)
+bw_row.pack()
+tk.Label(bw_row, text="Approximate Box Width (mm) ").pack(side=tk.LEFT)
+tk.Label(bw_row, textvariable=state.box_width).pack(side=tk.RIGHT)
+_make_tof_canvas(_tof_auto)
+
+# OPTICAL SENSOR
+os_card = _auto_card(auto_frame, "Optical Sensor", 3, 1)
+_stat_row(os_card, "Distance ", state.optical_sensor, 0)
 
 
 # ═══════════════════════════ CONNECTIONS ══════════════════════════════════════
@@ -217,13 +365,7 @@ for _c in range(2):
 threading.Thread(target=api.start_websocket,
                  args=(state,), daemon=True).start()
 
-
-def _auto_poll_lc():
-    if notebook.index(notebook.select()) == 1:
-        _thread(api.read_load_cell, state)
-    root.after(5000, _auto_poll_lc)
-
-
-root.after(5000, _auto_poll_lc)
+threading.Thread(target=api.get_calibration_factor,
+                 args=(state,), daemon=True).start()
 
 root.mainloop()
